@@ -1,3 +1,8 @@
+# 전체 처리 흐름 (Whole Process)
+
+다이어그램은 아래 코드 블록 안에 있어 Markdown이 테이블로 해석하지 않고, 그대로 정렬되어 보입니다.
+
+```
 ┌──────────────────────┐
 │ 1) User uploads file  │  사용자가 파일 업로드
 │    (PDF / TXT)        │  (PDF / TXT)
@@ -12,10 +17,10 @@
           │ (Every 1 minute)  매 1분마다
           ▼
 ┌──────────────────────────────────────────┐
-│ ADB "Poller" (a timer inside the DB)      │  ADB "폴러" (DB 내부 타이머)
-│ - Looks into the bucket                   │  - 버킷을 조회
-│ - Finds "new files not processed yet"     │  - "아직 처리되지 않은 새 파일" 탐지
-│ - Creates a "job" record in a table       │  - 테이블에 "작업" 레코드 생성
+│ ADB "Poller" (a timer inside the DB)     │  ADB "폴러" (DB 내부 타이머)
+│ - Looks into the bucket                  │  - 버킷을 조회
+│ - Finds "new files not processed yet"    │  - "아직 처리되지 않은 새 파일" 탐지
+│ - Creates a "job" record in a table      │  - 테이블에 "작업" 레코드 생성
 └─────────┬────────────────────────────────┘
           │  creates  생성
           ▼
@@ -29,13 +34,13 @@
           ▼
 ┌──────────────────────────────────────────┐
 │ ADB "Worker" (another timer in the DB)   │  ADB "워커" (DB 내 또 다른 타이머)
-│ - Takes 1 PENDING job                     │  - PENDING 작업 1건 선택
-│ - Downloads the file from storage         │  - 스토리지에서 파일 다운로드
-│ - Converts PDF→text (or reads text)       │  - PDF→텍스트 변환 (또는 텍스트 읽기)
-│ - Splits text into chunks                 │  - 텍스트를 청크로 분할
-│ - Makes embeddings for each chunk         │  - 각 청크에 대해 임베딩 생성
-│ - Saves results                           │  - 결과 저장
-│ - Marks job DONE (or ERROR)               │  - 작업을 DONE(또는 ERROR)으로 표시
+│ - Takes 1 PENDING job                    │  - PENDING 작업 1건 선택
+│ - Downloads the file from storage        │  - 스토리지에서 파일 다운로드
+│ - Converts PDF→text (or reads text)      │  - PDF→텍스트 변환 (또는 텍스트 읽기)
+│ - Splits text into chunks                │  - 텍스트를 청크로 분할
+│ - Makes embeddings for each chunk        │  - 각 청크에 대해 임베딩 생성
+│ - Saves results                          │  - 결과 저장
+│ - Marks job DONE (or ERROR)              │  - 작업을 DONE(또는 ERROR)으로 표시
 └─────────┬────────────────────────────────┘
           │  saves  저장
           ▼
@@ -43,10 +48,11 @@
 │ Chunk + Vector Table  │  청크 + 벡터 테이블
 │ chunk text + embedding│  청크 텍스트 + 임베딩
 └──────────────────────┘
+```
 
 ---
 
-**역할 요약 (Summary)**
+## 역할 요약 (Summary)
 
 | 역할 | 영어 | 한글 설명 |
 |------|------|-----------|
