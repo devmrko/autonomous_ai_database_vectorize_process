@@ -12,7 +12,7 @@
 1. Object Storage에서 다운로드 (`DBMS_CLOUD.GET_OBJECT`) → BLOB 로드
 2. (PDF) `DBMS_VECTOR_CHAIN.UTL_TO_TEXT(blob)` → CLOB 텍스트
 3. `UTL_TO_CHUNKS(text)` → 청크
-4. `UTL_TO_EMBEDDINGS(chunk, provider=ocigenai, model=cohere.embed-v4.0)` → 벡터
+4. **임베딩**: `DBMS_CLOUD_AI.GENERATE(..., profile_name => 'OCI_COHERE_EMBED', action => 'embedding')` 로 벡터 생성 (동일 credential `GENAI_CRED` 사용 가능)
 5. `doc_chunks`에 저장
 6. job 상태 DONE/ERROR 업데이트
 
@@ -30,7 +30,7 @@ ADB에서 Object Storage를 조회/다운로드하려면 credential이 필요합
 ```sql
 BEGIN
   DBMS_CLOUD.CREATE_CREDENTIAL(
-    credential_name => 'OBJSTORE_CRED',
+    credential_name => 'OBJ_STORE_CRED2',
     username        => '<oci-username-or-user-ocid>',
     password        => '<auth-token>'
   );
@@ -38,14 +38,49 @@ END;
 /
 ```
 
-### 1-2. GenAI 호출용 Credential (예: OCI GenAI endpoint)
+### 1-2. GenAI(임베딩) 호출용 Credential
 
-아래 예시는 개념상 이름만 보여드립니다. (환경에 따라 방식이 다름)
+`UTL_TO_EMBEDDING`으로 ocigenai를 쓰려면 OCI GenAI용 credential이 필요합니다.
 
-| 항목 | 값 |
-|------|-----|
-| credential_name | `OCI_GENAI_CRED` |
-| embed endpoint URL | `https://inference.generativeai.<region>.oci.oraclecloud.com/20231130/actions/embedText` |
+```sql
+-- OCI GenAI(ocigenai)용 credential. Object Storage credential과 별도로 생성.
+BEGIN
+  DBMS_VECTOR_CHAIN.CREATE_CREDENTIAL(
+    credential_name => 'OCI_GENAI_CRED',
+    params          => JSON('{
+      "user_ocid"       : "<user-ocid>",
+      "tenancy_ocid"    : "<tenancy-ocid>",
+      "compartment_ocid": "<compartment-ocid>",
+      "private_key"     : "<private-key-string-without-BEGIN-END-lines>",
+      "fingerprint"     : "<key-fingerprint>"
+    }')
+  );
+END;
+/
+```
+
+### 1-3. 임베딩용 DBMS_CLOUD_AI 프로필 (권장: Select AI와 동일 credential 사용)
+
+Select AI 채팅이 **GENAI_CRED**로 동작한다면, **같은 credential**로 임베딩도 하려면 **DBMS_CLOUD_AI**에 **임베딩 전용 프로필**을 하나 만듭니다.
+
+```sql
+BEGIN
+  DBMS_CLOUD_AI.CREATE_PROFILE(
+    profile_name => 'OCI_COHERE_EMBED',
+    attributes   => '{
+      "provider": "oci",
+      "credential_name": "GENAI_CRED",
+      "oci_compartment_id": "ocid1.tenancy.oc1..aaaaaaaa...",
+      "oci_apiformat": "COHERE",
+      "embedding_model": "cohere.embed-v4.0"
+    }'
+  );
+END;
+/
+```
+
+- `oci_compartment_id`: 테넌시 OCID 또는 사용 중인 컴파트먼트 OCID.
+- 채팅용 프로필(`GENAI`)과 별도로, **임베딩 전용** 프로필 이름(`OCI_COHERE_EMBED`)만 구분해 두면 됩니다.
 
 ---
 
@@ -130,52 +165,48 @@ CREATE TABLE doc_chunks (
 #### (A) poller 예시 (개념형, 실무에서 가장 많이 씀)
 
 ```sql
+
 CREATE OR REPLACE PROCEDURE poll_object_storage_to_jobs IS
-  v_objects_json CLOB;
   v_namespace    VARCHAR2(200) := '<your-namespace>';
   v_bucket       VARCHAR2(255) := '<your-bucket>';
   v_region       VARCHAR2(50)  := '<region>'; -- ap-osaka-1 등
+  v_uri_base  VARCHAR2(2000);
 BEGIN
-  -- 1) 버킷 오브젝트 목록(JSON)을 가져왔다고 가정
-  -- 환경에 따라 LIST_OBJECTS 결과가 table 형태일 수도, JSON일 수도 있으니
-  -- 실제 반환 타입에 맞게 아래 구간을 조정하세요.
-  --
-  -- v_objects_json := DBMS_CLOUD.LIST_OBJECTS(
-  --   credential_name => 'OBJSTORE_CRED',
-  --   location_uri    => 'https://objectstorage.'||v_region||'.oraclecloud.com/n/'||v_namespace||'/b/'||v_bucket||'/o/'
-  -- );
+  v_uri_base :=
+    'https://objectstorage.' || v_region || '.oraclecloud.com/n/' ||
+    v_namespace || '/b/' || v_bucket || '/o/';
 
-  -- 2) JSON_TABLE로 object_name/etag/size/mtime 등을 파싱해서 manifest upsert
+  /* 1) obj_manifest upsert */
   MERGE INTO obj_manifest m
   USING (
     SELECT
       v_bucket AS bucket_name,
-      jt.object_name,
-      jt.etag,
-      jt.size_bytes,
-      jt.last_modified
-    FROM JSON_TABLE(
-      v_objects_json,
-      '$.objects[*]'
-      COLUMNS (
-        object_name   VARCHAR2(1024) PATH '$.name',
-        etag          VARCHAR2(200)  PATH '$.etag',
-        size_bytes    NUMBER         PATH '$.size',
-        last_modified TIMESTAMP      PATH '$.timeModified'
+      o.object_name,
+      /* 아래 컬럼들은 환경에 따라 이름이 다를 수 있습니다.
+         우선 object_name/bytes(또는 size)/checksum(또는 etag)/last_modified를 확인하세요. */
+      o.bytes       AS size_bytes,
+      o.checksum    AS etag,
+      o.last_modified
+    FROM TABLE(
+      DBMS_CLOUD.LIST_OBJECTS(
+        credential_name => 'OBJ_STORE_CRED2',
+        location_uri    => v_uri_base
       )
-    ) jt
+    ) o
   ) s
-  ON (m.bucket_name = s.bucket_name AND m.object_name = s.object_name AND m.etag = s.etag)
+  ON (m.bucket_name = s.bucket_name
+      AND m.object_name = s.object_name
+      AND m.etag = s.etag)
   WHEN MATCHED THEN
     UPDATE SET
-      m.last_seen_at = SYSTIMESTAMP,
-      m.size_bytes = s.size_bytes,
-      m.last_modified = s.last_modified
+      m.last_seen_at   = SYSTIMESTAMP,
+      m.size_bytes     = s.size_bytes,
+      m.last_modified  = s.last_modified
   WHEN NOT MATCHED THEN
-    INSERT (bucket_name, object_name, etag, size_bytes, last_modified, processed_flag)
-    VALUES (s.bucket_name, s.object_name, s.etag, s.size_bytes, s.last_modified, 'N');
+    INSERT (bucket_name, object_name, etag, size_bytes, last_modified, processed_flag, last_seen_at)
+    VALUES (s.bucket_name, s.object_name, s.etag, s.size_bytes, s.last_modified, 'N', SYSTIMESTAMP);
 
-  -- 3) processed_flag='N' 인 것들을 job queue에 넣고 Y로 바꿈
+  /* 2) 신규(N) -> job queue */
   INSERT /*+ ignore_row_on_dupkey_index(doc_ingest_jobs doc_ingest_jobs_u1) */
     INTO doc_ingest_jobs(bucket_name, object_name, etag, size_bytes, object_uri, status)
   SELECT
@@ -183,8 +214,7 @@ BEGIN
     m.object_name,
     m.etag,
     m.size_bytes,
-    'https://objectstorage.'||v_region||'.oraclecloud.com/n/'||v_namespace||'/b/'||v_bucket||'/o/'||
-      REPLACE(m.object_name, ' ', '%20') AS object_uri,
+    v_uri_base || REPLACE(m.object_name, ' ', '%20') AS object_uri,
     'PENDING'
   FROM obj_manifest m
   WHERE m.bucket_name = v_bucket
@@ -212,12 +242,17 @@ END;
 
 ### 4-1. job 1개 처리
 
+임베딩은 **DBMS_CLOUD_AI.GENERATE** + **OCI_COHERE_EMBED** 프로필을 사용합니다. Select AI와 동일한 **GENAI_CRED** credential이 사용되므로 ORA-20003을 피할 수 있습니다.
+
 ```sql
 CREATE OR REPLACE PROCEDURE ingest_one_job(p_job_id IN NUMBER) IS
   v_uri         VARCHAR2(2000);
   v_blob        BLOB;
   v_text        CLOB;
-  v_embed_params CLOB;
+  v_error_msg   VARCHAR2(4000);
+  v_embed_clob  CLOB;
+  v_embed_array CLOB;
+  v_embedding   VECTOR;
 BEGIN
   -- job claim
   UPDATE doc_ingest_jobs
@@ -227,17 +262,17 @@ BEGIN
    WHERE job_id = p_job_id
      AND status = 'PENDING';
 
-  IF SQL%ROWCOUNT = 0 THEN
-    RETURN;
-  END IF;
+  IF SQL%ROWCOUNT = 0 THEN RETURN; END IF;
+
+  -- Clean up any existing chunks from previous failed attempts
+  DELETE FROM doc_chunks WHERE job_id = p_job_id;
 
   SELECT object_uri INTO v_uri
-    FROM doc_ingest_jobs
-   WHERE job_id = p_job_id;
+    FROM doc_ingest_jobs WHERE job_id = p_job_id;
 
-  -- download object into DATA_PUMP_DIR
+  -- download object into DATA_PUMP_DIR (Object Storage 전용 credential 쓰려면 OBJ_STORE_CRED2 등으로 변경)
   DBMS_CLOUD.GET_OBJECT(
-    credential_name => 'OBJSTORE_CRED',
+    credential_name => 'GENAI_CRED',
     object_uri      => v_uri,
     directory_name  => 'DATA_PUMP_DIR',
     file_name       => 'ingest_' || p_job_id
@@ -245,48 +280,45 @@ BEGIN
 
   -- load as BLOB
   SELECT TO_BLOB(BFILENAME('DATA_PUMP_DIR', 'ingest_' || p_job_id))
-    INTO v_blob
-    FROM dual;
+    INTO v_blob FROM dual;
 
   -- PDF/TXT -> text
   v_text := DBMS_VECTOR_CHAIN.UTL_TO_TEXT(v_blob);
 
-  -- embed params (update region, credential, etc.)
-  v_embed_params := '{
-    "provider": "ocigenai",
-    "credential_name": "OCI_GENAI_CRED",
-    "url": "https://inference.generativeai.<region>.oci.oraclecloud.com/20231130/actions/embedText",
-    "model": "cohere.embed-v4.0",
-    "batch_size": 10
-  }';
+  -- chunks + embeddings insert (DBMS_CLOUD_AI embedding profile 사용)
+  FOR rec IN (
+    SELECT JSON_VALUE(TO_CLOB(c.column_value), '$.chunk_id' RETURNING NUMBER) AS chunk_id,
+           JSON_VALUE(TO_CLOB(c.column_value), '$.chunk_offset' RETURNING NUMBER) AS chunk_offset,
+           JSON_VALUE(TO_CLOB(c.column_value), '$.chunk_length' RETURNING NUMBER) AS chunk_length,
+           JSON_VALUE(TO_CLOB(c.column_value), '$.chunk_data') AS chunk_data
+      FROM TABLE(DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(v_text)) c
+  ) LOOP
+    -- Embedding via DBMS_CLOUD_AI (same credential as Select AI)
+    v_embed_clob := DBMS_CLOUD_AI.GENERATE(
+      prompt       => rec.chunk_data,
+      profile_name => 'OCI_COHERE_EMBED',
+      action       => 'embedding'
+    );
 
-  -- chunks + embeddings insert
-  INSERT INTO doc_chunks(job_id, chunk_id, chunk_offset, chunk_length, chunk_text, embed_vector, meta_json)
-  SELECT
-    p_job_id,
-    jt.chunk_id,
-    jt.chunk_offset,
-    jt.chunk_length,
-    jt.chunk_data,
-    et.embed_vector,
-    JSON_OBJECT('source_uri' VALUE v_uri)
-  FROM
-    JSON_TABLE(
-      DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(v_text),
-      '$[*]' COLUMNS (
-        chunk_id     NUMBER PATH '$.chunk_id',
-        chunk_offset NUMBER PATH '$.chunk_offset',
-        chunk_length NUMBER PATH '$.chunk_length',
-        chunk_data   CLOB   PATH '$.chunk_data'
-      )
-    ) jt
-    CROSS JOIN
-    JSON_TABLE(
-      DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS(jt.chunk_data, JSON(v_embed_params)),
-      '$[*]' COLUMNS (
-        embed_vector VECTOR PATH '$.embed_vector'
-      )
-    ) et;
+    -- Response format: {"embeddings": [[0.1, 0.2, ...]]}
+    SELECT JSON_VALUE(v_embed_clob, '$.embeddings[0]')
+      INTO v_embed_array FROM dual;
+
+    v_embedding := TO_VECTOR(v_embed_array);
+
+    INSERT INTO doc_chunks(
+      job_id, chunk_id, chunk_offset, chunk_length,
+      chunk_text, embed_vector, meta_json
+    ) VALUES (
+      p_job_id,
+      rec.chunk_id,
+      rec.chunk_offset,
+      rec.chunk_length,
+      rec.chunk_data,
+      v_embedding,
+      JSON_OBJECT('source_uri' VALUE v_uri)
+    );
+  END LOOP;
 
   UPDATE doc_ingest_jobs
      SET status = 'DONE',
@@ -296,15 +328,15 @@ BEGIN
 
   COMMIT;
 
-EXCEPTION
-  WHEN OTHERS THEN
-    UPDATE doc_ingest_jobs
-       SET status = 'ERROR',
-           finished_at = SYSTIMESTAMP,
-           error_msg = SQLERRM
-     WHERE job_id = p_job_id;
-    COMMIT;
-    RAISE;
+EXCEPTION WHEN OTHERS THEN
+  v_error_msg := SQLERRM;
+  UPDATE doc_ingest_jobs
+     SET status = 'ERROR',
+         finished_at = SYSTIMESTAMP,
+         error_msg = v_error_msg
+   WHERE job_id = p_job_id;
+  COMMIT;
+  RAISE;
 END;
 /
 ```
@@ -315,13 +347,14 @@ END;
 CREATE OR REPLACE PROCEDURE ingest_worker IS
   v_job_id NUMBER;
 BEGIN
+  -- ORDER BY + FETCH와 FOR UPDATE는 함께 쓸 수 없음 (ORA-02014).
+  -- PENDING 1건만 골라서 가져오고, 실제 "점유"는 ingest_one_job 내부 UPDATE로 처리.
   SELECT job_id
     INTO v_job_id
     FROM doc_ingest_jobs
    WHERE status = 'PENDING'
    ORDER BY created_at
-   FETCH FIRST 1 ROWS ONLY
-   FOR UPDATE SKIP LOCKED;
+   FETCH FIRST 1 ROWS ONLY;
 
   ingest_one_job(v_job_id);
 
@@ -331,8 +364,6 @@ EXCEPTION
 END;
 /
 ```
-
----
 
 ## 5) DBMS_SCHEDULER 설정 (poller + worker)
 
@@ -382,45 +413,3 @@ END;
 ```
 
 ---
-
-## 6) 운영에서 꼭 넣는 보강 포인트
-
-### A) 파일 타입 분기 (PDF vs TXT)
-
-- `content_type`을 `LIST_OBJECTS`에서 가져오거나, object extension으로 분기
-- TXT는 `UTL_TO_TEXT(blob)` 없이 blob→clob 변환 루틴을 따로 둘 수 있음
-
-### B) 재시도 정책
-
-- `attempts < 3`이면 ERROR → 다시 PENDING으로 되돌리는 별도 job (backoff)
-- 너무 잦은 재시도는 GenAI 비용/쿼터를 소모하므로 주의
-
-### C) 대용량 파일
-
-- 너무 큰 PDF는 변환 시간이 길 수 있음 → worker가 1건 처리 시간 제한을 가지도록 설계 (예: 별도 timeout/분할)
-- chunk size/overlap 튜닝
-
-### D) 중복/변경 감지
-
-- **etag**가 가장 좋음
-- 없다면 `(size_bytes, last_modified)`를 같이 저장해 변경을 추정
-- "같은 파일명으로 덮어쓰기"가 많으면 etag 필수에 가까움
-
----
-
-## 7) 빠른 테스트 순서
-
-1. `OBJSTORE_CRED`, `OCI_GENAI_CRED` 만들기
-2. 테이블/프로시저 생성
-3. 스케줄러 실행
-4. Object Storage에 PDF 1개 업로드
-5. 아래로 상태 확인
-
-```sql
-SELECT * FROM doc_ingest_jobs ORDER BY created_at DESC FETCH FIRST 10 ROWS ONLY;
-SELECT COUNT(*) FROM doc_chunks WHERE job_id = :job_id;
-```
-
----
-
-*EN (English) — Full "DB-only polling" workflow*
