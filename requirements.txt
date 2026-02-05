@@ -1,0 +1,5 @@
+# Knowledge bot + vector search
+streamlit>=1.28.0
+oracledb>=2.0.0
+oci>=2.100.0
+python-dotenv>=1.0.0
