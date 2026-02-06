@@ -237,10 +237,12 @@ def get_ingest_job_status(db: DatabaseManager) -> Dict[str, Any]:
 
 def toggle_scheduler_job(db: DatabaseManager, job_name: str, enable: bool) -> bool:
     """Enable or disable a scheduler job."""
-    action = "ENABLE" if enable else "DISABLE"
-    q = f"BEGIN DBMS_SCHEDULER.{action}(:job_name, force => TRUE); END;"
+    if enable:
+        q = f"BEGIN DBMS_SCHEDULER.ENABLE('{job_name}'); END;"
+    else:
+        q = f"BEGIN DBMS_SCHEDULER.DISABLE('{job_name}', force => TRUE); END;"
     try:
-        db.execute_procedure(q, params={"job_name": job_name})
+        db.execute_procedure(q)
         return True
     except Exception as e:
         logger.error("toggle_scheduler_job failed: %s", e)
