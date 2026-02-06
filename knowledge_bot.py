@@ -208,7 +208,7 @@ def get_ingest_job_status(db: DatabaseManager) -> Dict[str, Any]:
     recent_q = """
     SELECT job_id, object_name, status, attempts,
            TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') as created,
-           SUBSTR(error_msg, 1, 100) as error_preview
+           CAST(SUBSTR(error_msg, 1, 200) AS VARCHAR2(200)) as error_preview
       FROM doc_ingest_jobs
      ORDER BY created_at DESC
      FETCH FIRST 20 ROWS ONLY

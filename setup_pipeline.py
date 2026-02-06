@@ -213,7 +213,8 @@ BEGIN
             JSON_OBJECT('source_uri' VALUE v_uri));
   END LOOP;
 
-  UPDATE doc_ingest_jobs SET status = 'CHUNKED', chunked_at = SYSTIMESTAMP, error_msg = NULL
+  UPDATE doc_ingest_jobs 
+     SET status = 'CHUNKED', chunked_at = SYSTIMESTAMP, error_msg = NULL
    WHERE job_id = p_job_id;
   COMMIT;
 EXCEPTION WHEN OTHERS THEN
@@ -226,45 +227,63 @@ END;
 
 
 def get_sql_stage2_procedure():
-    """Generate ingest_stage2_embed procedure."""
+    """Generate ingest_stage2_embed procedure - EXACT copy from README."""
     return f"""
 CREATE OR REPLACE PROCEDURE ingest_stage2_embed(p_job_id IN NUMBER) IS
   v_uri         VARCHAR2(2000);
   v_error_msg   VARCHAR2(4000);
   v_embed_clob  CLOB;
+  v_embedding   VECTOR;
 BEGIN
-  UPDATE doc_ingest_jobs SET status = 'EMBEDDING', attempts = attempts + 1
-   WHERE job_id = p_job_id AND status IN ('CHUNKED', 'EMBED_ERROR');
+  -- Job claim: CHUNKED -> EMBEDDING
+  UPDATE doc_ingest_jobs
+     SET status   = 'EMBEDDING',
+         attempts = attempts + 1
+   WHERE job_id = p_job_id
+     AND status IN ('CHUNKED', 'EMBED_ERROR');
+
   IF SQL%ROWCOUNT = 0 THEN RETURN; END IF;
 
-  SELECT object_uri INTO v_uri FROM doc_ingest_jobs WHERE job_id = p_job_id;
+  SELECT object_uri INTO v_uri
+    FROM doc_ingest_jobs WHERE job_id = p_job_id;
 
+  -- embed_vector가 NULL인 청크만 처리
   FOR rec IN (
-    SELECT chunk_id, chunk_text FROM doc_chunks
-     WHERE job_id = p_job_id AND embed_vector IS NULL ORDER BY chunk_id
+    SELECT chunk_id, chunk_text
+      FROM doc_chunks
+     WHERE job_id = p_job_id
+       AND embed_vector IS NULL
+     ORDER BY chunk_id
   ) LOOP
-    BEGIN
-      v_embed_clob := DBMS_CLOUD_AI.GENERATE(
-        prompt       => 'Text to embed: "' || TRIM(rec.chunk_text) || '"',
-        profile_name => '{CONFIG["embed_profile"]}',
-        action       => 'embedding'
-      );
-      UPDATE doc_chunks
-         SET embed_vector = TO_VECTOR(JSON_SERIALIZE(JSON_QUERY(v_embed_clob, '$')))
-       WHERE job_id = p_job_id AND chunk_id = rec.chunk_id;
-    EXCEPTION WHEN OTHERS THEN
-      v_error_msg := SUBSTR('Chunk ' || rec.chunk_id || ': ' || SQLERRM, 1, 4000);
-      UPDATE doc_ingest_jobs SET error_msg = v_error_msg WHERE job_id = p_job_id;
-      COMMIT;
-    END;
+    v_embed_clob := DBMS_CLOUD_AI.GENERATE(
+      prompt       => 'Text to embed: "' || rec.chunk_text || '"',
+      profile_name => '{CONFIG["embed_profile"]}',
+      action       => 'embedding'
+    );
+
+    v_embedding := TO_VECTOR(TRIM(v_embed_clob));
+
+    UPDATE doc_chunks
+       SET embed_vector = v_embedding
+     WHERE job_id = p_job_id
+       AND chunk_id = rec.chunk_id;
   END LOOP;
 
-  UPDATE doc_ingest_jobs SET status = 'DONE', finished_at = SYSTIMESTAMP, error_msg = NULL
+  -- DONE
+  UPDATE doc_ingest_jobs
+     SET status      = 'DONE',
+         finished_at = SYSTIMESTAMP,
+         error_msg   = NULL
    WHERE job_id = p_job_id;
+
   COMMIT;
+
 EXCEPTION WHEN OTHERS THEN
   v_error_msg := SQLERRM;
-  UPDATE doc_ingest_jobs SET status = 'EMBED_ERROR', error_msg = v_error_msg WHERE job_id = p_job_id;
+  UPDATE doc_ingest_jobs
+     SET status    = 'EMBED_ERROR',
+         error_msg = v_error_msg
+   WHERE job_id = p_job_id;
   COMMIT;
   RAISE;
 END;
@@ -518,12 +537,22 @@ def create_ai_profile(conn):
     """
     execute_plsql(conn, drop_sql)
     
-    # Create profile
+    # Create profile for OCI Generative AI embedding
+    # Uses 'oci' provider with object_list containing model info
     create_sql = f"""
     BEGIN
         DBMS_CLOUD_AI.CREATE_PROFILE(
             profile_name => '{CONFIG["embed_profile"]}',
-            attributes   => '{{"provider":"oci","credential_name":"{CONFIG["credential_name"]}","url":"https://inference.generativeai.{region}.oci.oraclecloud.com/20231130/actions/embedText","model":"cohere.embed-multilingual-v3.0"}}'
+            attributes   => '{{
+                "provider": "oci",
+                "credential_name": "{CONFIG["credential_name"]}",
+                "object_list": [
+                    {{"owner": "ADMIN", "name": "DOC_CHUNKS"}}
+                ],
+                "model": "cohere.embed-multilingual-v3.0",
+                "oci_apiformat": "COHERE",
+                "region": "{region}"
+            }}'
         );
     END;
     """
@@ -532,8 +561,29 @@ def create_ai_profile(conn):
         logger.info(f"  Created AI profile: {CONFIG['embed_profile']}")
         return True
     except Exception as e:
-        logger.error(f"  Failed to create AI profile: {e}")
-        return False
+        logger.warning(f"  Profile creation with object_list failed: {e}")
+        logger.info("  Trying simpler profile format...")
+        
+        # Try simpler format
+        simple_sql = f"""
+        BEGIN
+            DBMS_CLOUD_AI.CREATE_PROFILE(
+                profile_name => '{CONFIG["embed_profile"]}',
+                attributes   => '{{
+                    "provider": "oci",
+                    "credential_name": "{CONFIG["credential_name"]}",
+                    "model": "cohere.embed-multilingual-v3.0"
+                }}'
+            );
+        END;
+        """
+        try:
+            execute_plsql(conn, simple_sql)
+            logger.info(f"  Created AI profile (simple): {CONFIG['embed_profile']}")
+            return True
+        except Exception as e2:
+            logger.error(f"  Failed to create AI profile: {e2}")
+            return False
 
 
 def create_tables(conn):
